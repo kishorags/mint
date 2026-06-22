@@ -148,7 +148,7 @@ func main() {
 	}
 	srv := api.New(st, c, l2, rdb, limiter, adminToken, peppers, replicaID)
 
-	go cache.SubscribeRevocations(context.Background(), rdb, c)
+	go cache.SubscribeRevocations(context.Background(), rdb, c, replicaID)
 	flusherCtx, flusherCancel := context.WithCancel(context.Background())
 	flusher := usage.NewFlusher(rdb, st, replicaID, flushInterval)
 	go flusher.Run(flusherCtx)

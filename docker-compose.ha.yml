@@ -55,8 +55,8 @@ services:
       redis-primary:
         condition: service_healthy
 
-  # Sentinel nodes (3 for quorum).
-  sentinel-1:
+  # Sentinel nodes (3 for quorum). Shared config via YAML anchor.
+  sentinel-1: &sentinel
     image: redis:7-alpine@sha256:b1addbe72465a718643cff9e60a58e6df1841e29d6d7d60c9a85d8d72f08d1a7
     command: >
       sh -c 'echo "sentinel monitor mymaster redis-primary 6379 2" > /tmp/sentinel.conf &&
@@ -68,26 +68,10 @@ services:
         condition: service_healthy
 
   sentinel-2:
-    image: redis:7-alpine@sha256:b1addbe72465a718643cff9e60a58e6df1841e29d6d7d60c9a85d8d72f08d1a7
-    command: >
-      sh -c 'echo "sentinel monitor mymaster redis-primary 6379 2" > /tmp/sentinel.conf &&
-             echo "sentinel down-after-milliseconds mymaster 5000" >> /tmp/sentinel.conf &&
-             echo "sentinel failover-timeout mymaster 10000" >> /tmp/sentinel.conf &&
-             redis-sentinel /tmp/sentinel.conf'
-    depends_on:
-      redis-primary:
-        condition: service_healthy
+    <<: *sentinel
 
   sentinel-3:
-    image: redis:7-alpine@sha256:b1addbe72465a718643cff9e60a58e6df1841e29d6d7d60c9a85d8d72f08d1a7
-    command: >
-      sh -c 'echo "sentinel monitor mymaster redis-primary 6379 2" > /tmp/sentinel.conf &&
-             echo "sentinel down-after-milliseconds mymaster 5000" >> /tmp/sentinel.conf &&
-             echo "sentinel failover-timeout mymaster 10000" >> /tmp/sentinel.conf &&
-             redis-sentinel /tmp/sentinel.conf'
-    depends_on:
-      redis-primary:
-        condition: service_healthy
+    <<: *sentinel
 
   # Remove the standalone redis service from the base compose.
   redis:

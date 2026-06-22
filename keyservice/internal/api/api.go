@@ -243,6 +243,11 @@ func (s *Server) handleValidate(w http.ResponseWriter, r *http.Request) {
 
 	// Reject obviously malformed keys before touching cache or DB.
 	if !validKeyFormat.MatchString(rawKey) {
+		// Apply timing floor to prevent distinguishing malformed from valid keys.
+		elapsed := time.Since(timeFromContext(r.Context()))
+		if pad := 2*time.Millisecond - elapsed; pad > 0 {
+			time.Sleep(pad)
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusUnauthorized)
 		_ = json.NewEncoder(w).Encode(struct {

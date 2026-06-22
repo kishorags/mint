@@ -44,15 +44,16 @@ func PublishRevocation(ctx context.Context, rdb *redis.Client, keyHash string) e
 // consumer group. Each replica creates its own consumer within the group,
 // ACKs processed entries, and evicts revoked keys from the local L1 cache.
 // This replaces the fire-and-forget pub/sub model with at-least-once delivery.
-func SubscribeRevocations(ctx context.Context, rdb *redis.Client, l1 *Cache) {
+func SubscribeRevocations(ctx context.Context, rdb *redis.Client, l1 *Cache, replicaID string) {
 	const groupName = "keyservice"
 
 	// Create the consumer group if it doesn't exist. Start reading from
 	// the beginning ("0") so new replicas catch up on missed revocations.
 	_ = rdb.XGroupCreateMkStream(ctx, RevocationStream, groupName, "0").Err()
 
-	// Use the replica's hostname as the consumer name for observability.
-	consumerName := "consumer-" + time.Now().Format("20060102-150405.000")
+	// Use the replica's stable ID as the consumer name so restarts resume
+	// from the same consumer position without leaving orphaned consumers.
+	consumerName := "consumer-" + replicaID
 
 	for {
 		select {
