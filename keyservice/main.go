@@ -130,7 +130,7 @@ func main() {
 					TenantID:     k.TenantID,
 					KeyID:        k.KeyID,
 					MonthlyQuota: k.MonthlyQuota,
-				}, time.Hour) // long TTL; pub/sub evicts on revoke
+				}, 5*time.Minute) // short TTL; pub/sub + streams evict on revoke
 			}
 			log.Printf("prewarmed %d keys into L1", len(keysList))
 		}

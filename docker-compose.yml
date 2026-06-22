@@ -25,7 +25,7 @@ services:
 
   #---------------------------migrate: one-shot, runs schema migrations then exits
   migrate:
-    image: migrate/migrate:v4.17.1
+    image: migrate/migrate:v4.17.1@sha256:9567411804cda973cfc8005ce0805d0d80129c54e4be28bbf46f259396e34cc9
     volumes:
       - ./keyservice/migrations:/migrations:ro
     command:
@@ -52,7 +52,7 @@ services:
 
   #-------------------------------------postgres:
   postgres:
-    image: postgres:16-alpine
+    image: postgres:16-alpine@sha256:0fc5c901ec0a3c55ce70b99b040daeb89d5b35b61febbced1b4b24dbc3153ec8
     environment:
       POSTGRES_USER: mint
       POSTGRES_PASSWORD: mint_dev
@@ -70,7 +70,7 @@ services:
 
   #-----------------------------------------redis: cache +  counter + rate-limit state-----------------
   redis:
-    image: redis:7-alpine
+    image: redis:7-alpine@sha256:b1addbe72465a718643cff9e60a58e6df1841e29d6d7d60c9a85d8d72f08d1a7
     ports:
       - "6379:6379"
     volumes:
@@ -84,7 +84,7 @@ services:
 
   #------- Promethus
   prometheus:
-    image: prom/prometheus:v2.54.1
+    image: prom/prometheus:v2.54.1@sha256:69961df6ffa67598048a31aa2822d61f3c93b91d7db24e44d9bb03f99d520da9
     volumes:
       - ./infra/prometheus.yml:/etc/prometheus/prometheus.yml:ro
     ports:
@@ -94,7 +94,7 @@ services:
 
   #---------------grafana
   grafana:
-    image: grafana/grafana:11.2.0
+    image: grafana/grafana:11.2.0@sha256:37a5d8860aef847dfa09f5f8947f010f6479f98cf7820b5186f9c6314b44be60
     ports:
       - "3000:3000"
     environment:

@@ -24,11 +24,14 @@ var (
 // go through the methods, never the raw pool.
 type Store struct {
 	pool *pgxpool.Pool
+	sem  *querySemaphore
 }
 
 // New is the constructor convention in Go: a package-level func returning the type.
+// The semaphore limits concurrent in-flight queries to 8 (of the default 10
+// pool connections), leaving headroom for health checks and admin queries.
 func New(pool *pgxpool.Pool) *Store {
-	return &Store{pool: pool}
+	return &Store{pool: pool, sem: newQuerySemaphore(8)}
 }
 
 // Tenant is the row shape returned to callers. JSON tags travel with it so the
@@ -104,8 +107,14 @@ type ValidatedKey struct {
 }
 
 // ValidateKey looks up a key by its hash and confirms both the key and its tenant are active.
-// Any miss collapses to ErrKeyNotValid
+// Any miss collapses to ErrKeyNotValid. Returns ErrBackpressure if the query
+// semaphore is full (circuit breaker).
 func (s *Store) ValidateKey(ctx context.Context, keyHash []byte) (ValidatedKey, error) {
+	if err := s.sem.Acquire(ctx); err != nil {
+		return ValidatedKey{}, err
+	}
+	defer s.sem.Release()
+
 	var vk ValidatedKey
 	err := s.pool.QueryRow(ctx,
 		`SELECT k.id, k.tenant_id, COALESCE(t.monthly_quota,0)

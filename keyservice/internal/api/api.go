@@ -11,6 +11,7 @@ import (
 	"log"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -27,7 +28,7 @@ import (
 
 const (
 	ttlValid   = 5 * time.Minute
-	ttlInvalid = 30 * time.Second
+	ttlInvalid = 30 * time.Second // reduced from 5 min to limit negative-cache pollution
 
 	// maxBodySize caps request bodies to prevent memory exhaustion from
 	// oversized payloads. 1 MB is far more than any legitimate admin request.
@@ -36,6 +37,11 @@ const (
 	// maxNameLen caps tenant and key name fields.
 	maxNameLen = 256
 )
+
+// validKeyFormat matches the expected API key format: ak_live_ + 32 base62 chars.
+// Keys that don't match are rejected immediately without touching cache or DB,
+// preventing cache pollution from obviously malformed keys.
+var validKeyFormat = regexp.MustCompile(`^ak_live_[0-9A-Za-z]{32}$`)
 
 // Server holds the handlers' dependencies. Lowercase fields => private; they
 // are injected once via New and never mutated.
@@ -230,6 +236,16 @@ func (s *Server) handleValidate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Reject obviously malformed keys before touching cache or DB.
+	if !validKeyFormat.MatchString(rawKey) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_ = json.NewEncoder(w).Encode(struct {
+			Valid bool `json:"valid"`
+		}{false})
+		return
+	}
+
 	// Hash with the current pepper first; if the key was issued under a
 	// previous pepper (rotation window), we fall back through them all.
 	keyHashes := keys.HashAll(s.peppers, rawKey)
@@ -263,6 +279,10 @@ func (s *Server) handleValidate(w http.ResponseWriter, r *http.Request) {
 	for _, kh := range keyHashes {
 		vk, err := s.store.ValidateKey(ctx, kh)
 		if err != nil {
+			if errors.Is(err, store.ErrBackpressure) {
+				writeJSONError(w, http.StatusServiceUnavailable, "service overloaded")
+				return
+			}
 			if !errors.Is(err, store.ErrKeyNotValid) {
 				log.Printf("validate key: %v", err)
 				writeJSONError(w, http.StatusInternalServerError, "internal error")

@@ -28,7 +28,7 @@ services:
         condition: service_completed_successfully
 
   migrate:
-    image: migrate/migrate:v4.17.1
+    image: migrate/migrate:v4.17.1@sha256:9567411804cda973cfc8005ce0805d0d80129c54e4be28bbf46f259396e34cc9
     volumes:
       - ./keyservice/migrations:/migrations:ro
     command:
@@ -54,7 +54,7 @@ services:
       - keyservice
 
   postgres:
-    image: postgres:16-alpine
+    image: postgres:16-alpine@sha256:0fc5c901ec0a3c55ce70b99b040daeb89d5b35b61febbced1b4b24dbc3153ec8
     environment:
       POSTGRES_USER: mint
       POSTGRES_PASSWORD: mint_dev
@@ -66,7 +66,7 @@ services:
       retries: 15
 
   redis:
-    image: redis:7-alpine
+    image: redis:7-alpine@sha256:b1addbe72465a718643cff9e60a58e6df1841e29d6d7d60c9a85d8d72f08d1a7
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 3s
