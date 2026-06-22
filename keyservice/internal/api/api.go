@@ -26,6 +26,13 @@ import (
 const (
 	ttlValid   = 5 * time.Minute
 	ttlInvalid = 30 * time.Second
+
+	// maxBodySize caps request bodies to prevent memory exhaustion from
+	// oversized payloads. 1 MB is far more than any legitimate admin request.
+	maxBodySize = 1 << 20 // 1 MB
+
+	// maxNameLen caps tenant and key name fields.
+	maxNameLen = 256
 )
 
 // Server holds the handlers' dependencies. Lowercase fields => private; they
@@ -39,6 +46,7 @@ type Server struct {
 	adminToken string
 	keyPepper  string
 	replicaID  string
+	adminLim   *adminLimiter
 
 	l1Hits atomic.Int64
 	l2Hits atomic.Int64
@@ -46,7 +54,7 @@ type Server struct {
 }
 
 func New(st *store.Store, c *cache.Cache, l2 *cache.L2, rdb *redis.Client, limiter *ratelimit.Limiter, adminToken, keyPepper, replicaID string) *Server {
-	return &Server{store: st, cache: c, l2: l2, rdb: rdb, limiter: limiter, adminToken: adminToken, keyPepper: keyPepper, replicaID: replicaID}
+	return &Server{store: st, cache: c, l2: l2, rdb: rdb, limiter: limiter, adminToken: adminToken, keyPepper: keyPepper, replicaID: replicaID, adminLim: newAdminLimiter(10, 20)}
 }
 
 // Routes builds the router. All registration happens here, once — the lesson
@@ -54,12 +62,12 @@ func New(st *store.Store, c *cache.Cache, l2 *cache.L2, rdb *redis.Client, limit
 func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
-	mux.HandleFunc("POST /admin/tenants", s.handleCreateTenant)
-	mux.HandleFunc("POST /v1/tenants/{id}/keys", s.handleCreateKey)
+	mux.HandleFunc("POST /admin/tenants", adminRateLimit(s.adminLim, s.handleCreateTenant))
+	mux.HandleFunc("POST /v1/tenants/{id}/keys", adminRateLimit(s.adminLim, s.handleCreateKey))
 	mux.HandleFunc("POST /v1/validate", s.handleValidate)
-	mux.HandleFunc("POST /v1/keys/{id}/revoke", s.handleRevokeKey)
+	mux.HandleFunc("POST /v1/keys/{id}/revoke", adminRateLimit(s.adminLim, s.handleRevokeKey))
 	mux.HandleFunc("GET /v1/cache/stats", s.handleCacheStats)
-	mux.HandleFunc("GET /v1/tenants/{id}/usage", s.handleTenantUsage)
+	mux.HandleFunc("GET /v1/tenants/{id}/usage", adminRateLimit(s.adminLim, s.handleTenantUsage))
 	mux.HandleFunc("GET /readyz", s.handleReadyz)
 	mux.Handle("GET /metrics", promhttp.Handler()) // ← expose the metrics page
 	return metricsMiddleware(mux)
@@ -80,12 +88,13 @@ func (s *Server) handleCreateTenant(w http.ResponseWriter, r *http.Request) {
 		Name         string `json:"name"`
 		MonthlyQuota *int64 `json:"monthly_quota"`
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid JSON")
 		return
 	}
-	if strings.TrimSpace(req.Name) == "" {
-		writeJSONError(w, http.StatusBadRequest, "name is required")
+	if err := validateName(req.Name); err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -111,12 +120,13 @@ func (s *Server) handleCreateKey(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Name string `json:"name"`
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid JSON")
 		return
 	}
-	if strings.TrimSpace(req.Name) == "" {
-		writeJSONError(w, http.StatusBadRequest, "name is required")
+	if err := validateName(req.Name); err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -161,6 +171,24 @@ func writeJSONError(w http.ResponseWriter, status int, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	fmt.Fprintf(w, `{"error":%q}`+"\n", msg)
+}
+
+// validateName checks a name field is non-empty, within length limits, and
+// contains no control characters or null bytes.
+func validateName(name string) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return fmt.Errorf("name is required")
+	}
+	if len(name) > maxNameLen {
+		return fmt.Errorf("name exceeds maximum length of %d characters", maxNameLen)
+	}
+	for _, r := range name {
+		if r == 0 || (r < 32 && r != '\t') {
+			return fmt.Errorf("name contains invalid control characters")
+		}
+	}
+	return nil
 }
 
 func (s *Server) handleValidate(w http.ResponseWriter, r *http.Request) {

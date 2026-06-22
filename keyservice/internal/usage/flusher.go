@@ -39,7 +39,7 @@ func (f *Flusher) Run(ctx context.Context) {
 				continue
 			}
 			t0 := time.Now()
-			n, err := f.flushOnce(ctx)
+			n, err := f.FlushOnce(ctx)
 			flushDuration.Observe(float64(time.Since(t0).Seconds()))
 			if err != nil {
 				log.Printf("usage flush failed: %v", err)
@@ -66,9 +66,10 @@ func (f *Flusher) acquireLease(ctx context.Context) bool {
 	return ok
 }
 
-// flushOnce reads every usage counter from Redis and mirrors it to Postgres in
-// one batched UPSERT. Returns how many counters were mirrored.
-func (f *Flusher) flushOnce(ctx context.Context) (int, error) {
+// FlushOnce reads every usage counter from Redis and mirrors it to Postgres in
+// one batched UPSERT. Returns how many counters were mirrored. Exported so
+// main can trigger a final flush on graceful shutdown.
+func (f *Flusher) FlushOnce(ctx context.Context) (int, error) {
 	// SCAN( never KEYS) for usage:* - non blocking, cursor based
 	var keys []string
 	iter := f.rdb.Scan(ctx, 0, Prefix+"*", 100).Iterator()

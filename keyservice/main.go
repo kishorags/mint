@@ -8,7 +8,9 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
 	"time"
 
 	"github.com/Sashreek007/mint/keyservice/internal/api"
@@ -134,11 +136,45 @@ func main() {
 	srv := api.New(st, c, l2, rdb, limiter, adminToken, keyPepper, replicaID)
 
 	go cache.SubscribeRevocations(context.Background(), rdb, c)
+	flusherCtx, flusherCancel := context.WithCancel(context.Background())
 	flusher := usage.NewFlusher(rdb, st, replicaID, flushInterval)
-	go flusher.Run(context.Background())
+	go flusher.Run(flusherCtx)
+
 	addr := ":8080"
-	log.Printf("keyservice replica=%s listening on %s", replicaID, addr)
-	if err := http.ListenAndServe(addr, srv.Routes()); err != nil {
-		log.Fatalf("server failed: %v", err)
+	httpSrv := &http.Server{
+		Addr:    addr,
+		Handler: srv.Routes(),
 	}
+
+	// Graceful shutdown: drain in-flight requests on SIGTERM/SIGINT.
+	shutdownCh := make(chan os.Signal, 1)
+	signal.Notify(shutdownCh, syscall.SIGTERM, syscall.SIGINT)
+
+	go func() {
+		log.Printf("keyservice replica=%s listening on %s", replicaID, addr)
+		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("server failed: %v", err)
+		}
+	}()
+
+	sig := <-shutdownCh
+	log.Printf("received %s, draining connections…", sig)
+
+	drainCtx, drainCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer drainCancel()
+
+	if err := httpSrv.Shutdown(drainCtx); err != nil {
+		log.Printf("http shutdown error: %v", err)
+	}
+
+	// Stop the flusher and perform a final flush.
+	flusherCancel()
+	log.Printf("performing final usage flush…")
+	if n, err := flusher.FlushOnce(context.Background()); err != nil {
+		log.Printf("final flush failed: %v", err)
+	} else if n > 0 {
+		log.Printf("final flush: mirrored %d counter(s)", n)
+	}
+
+	log.Printf("shutdown complete")
 }
