@@ -45,6 +45,10 @@ func main() {
 	if keyPepper == "" {
 		log.Fatal("KEY_PEPPER is required")
 	}
+	// KEY_PEPPER_PREV supports pepper rotation: during the rotation window,
+	// validation tries the current pepper first, then falls back to the
+	// previous one. New keys are always hashed with the current pepper.
+	keyPepperPrev := os.Getenv("KEY_PEPPER_PREV")
 
 	redisURL := os.Getenv("REDIS_URL")
 	if redisURL == "" {
@@ -133,7 +137,14 @@ func main() {
 	}
 	l2 := cache.NewL2(rdb)
 	limiter := ratelimit.New(rateLimit, rateBurst) // 100 req/sec, burst 200, per key
-	srv := api.New(st, c, l2, rdb, limiter, adminToken, keyPepper, replicaID)
+
+	// Build the pepper list: current pepper first, then previous (if set).
+	peppers := []string{keyPepper}
+	if keyPepperPrev != "" {
+		peppers = append(peppers, keyPepperPrev)
+		log.Printf("pepper rotation active: will try current + previous pepper")
+	}
+	srv := api.New(st, c, l2, rdb, limiter, adminToken, peppers, replicaID)
 
 	go cache.SubscribeRevocations(context.Background(), rdb, c)
 	flusherCtx, flusherCancel := context.WithCancel(context.Background())
