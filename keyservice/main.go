@@ -3,12 +3,15 @@ package main
 import (
 	"context"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/redis/go-redis/v9"
 	"log"
 	"log/slog"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
 	"time"
 
 	"github.com/Sashreek007/mint/keyservice/internal/api"
@@ -43,6 +46,10 @@ func main() {
 	if keyPepper == "" {
 		log.Fatal("KEY_PEPPER is required")
 	}
+	// KEY_PEPPER_PREV supports pepper rotation: during the rotation window,
+	// validation tries the current pepper first, then falls back to the
+	// previous one. New keys are always hashed with the current pepper.
+	keyPepperPrev := os.Getenv("KEY_PEPPER_PREV")
 
 	redisURL := os.Getenv("REDIS_URL")
 	if redisURL == "" {
@@ -111,6 +118,7 @@ func main() {
 	log.Printf("postgres ok: max_conns=%d", cfg.MaxConns)
 
 	st := store.New(pool)
+	prometheus.MustRegister(store.NewPoolCollector(pool))
 	c := cache.New()
 	// Pre-warm L1 with the hot key set (skip if PREWARM_LIMIT=0).
 	if prewarmLimit > 0 {
@@ -124,21 +132,62 @@ func main() {
 					TenantID:     k.TenantID,
 					KeyID:        k.KeyID,
 					MonthlyQuota: k.MonthlyQuota,
-				}, time.Hour) // long TTL; pub/sub evicts on revoke
+				}, 5*time.Minute) // short TTL; pub/sub + streams evict on revoke
 			}
 			log.Printf("prewarmed %d keys into L1", len(keysList))
 		}
 	}
 	l2 := cache.NewL2(rdb)
 	limiter := ratelimit.New(rateLimit, rateBurst) // 100 req/sec, burst 200, per key
-	srv := api.New(st, c, l2, rdb, limiter, adminToken, keyPepper, replicaID)
 
-	go cache.SubscribeRevocations(context.Background(), rdb, c)
-	flusher := usage.NewFlusher(rdb, st, replicaID, flushInterval)
-	go flusher.Run(context.Background())
-	addr := ":8080"
-	log.Printf("keyservice replica=%s listening on %s", replicaID, addr)
-	if err := http.ListenAndServe(addr, srv.Routes()); err != nil {
-		log.Fatalf("server failed: %v", err)
+	// Build the pepper list: current pepper first, then previous (if set).
+	peppers := []string{keyPepper}
+	if keyPepperPrev != "" {
+		peppers = append(peppers, keyPepperPrev)
+		log.Printf("pepper rotation active: will try current + previous pepper")
 	}
+	srv := api.New(st, c, l2, rdb, limiter, adminToken, peppers, replicaID)
+
+	go cache.SubscribeRevocations(context.Background(), rdb, c, replicaID)
+	flusherCtx, flusherCancel := context.WithCancel(context.Background())
+	flusher := usage.NewFlusher(rdb, st, replicaID, flushInterval)
+	go flusher.Run(flusherCtx)
+
+	addr := ":8080"
+	httpSrv := &http.Server{
+		Addr:    addr,
+		Handler: srv.Routes(),
+	}
+
+	// Graceful shutdown: drain in-flight requests on SIGTERM/SIGINT.
+	shutdownCh := make(chan os.Signal, 1)
+	signal.Notify(shutdownCh, syscall.SIGTERM, syscall.SIGINT)
+
+	go func() {
+		log.Printf("keyservice replica=%s listening on %s", replicaID, addr)
+		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("server failed: %v", err)
+		}
+	}()
+
+	sig := <-shutdownCh
+	log.Printf("received %s, draining connections…", sig)
+
+	drainCtx, drainCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer drainCancel()
+
+	if err := httpSrv.Shutdown(drainCtx); err != nil {
+		log.Printf("http shutdown error: %v", err)
+	}
+
+	// Stop the flusher and perform a final flush.
+	flusherCancel()
+	log.Printf("performing final usage flush…")
+	if n, err := flusher.FlushOnce(context.Background()); err != nil {
+		log.Printf("final flush failed: %v", err)
+	} else if n > 0 {
+		log.Printf("final flush: mirrored %d counter(s)", n)
+	}
+
+	log.Printf("shutdown complete")
 }

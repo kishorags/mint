@@ -1,0 +1,7 @@
+# Never commit private keys or certificates to version control.
+*.key
+*.crt
+*.csr
+*.pem
+*.p12
+!README.md

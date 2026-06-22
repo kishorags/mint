@@ -9,11 +9,14 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"log/slog"
 	"net/http"
+	"regexp"
 	"strings"
 	"sync/atomic"
 	"time"
 
+	"github.com/Sashreek007/mint/keyservice/internal/adminauth"
 	"github.com/Sashreek007/mint/keyservice/internal/cache"
 	"github.com/Sashreek007/mint/keyservice/internal/keys"
 	"github.com/Sashreek007/mint/keyservice/internal/ratelimit"
@@ -25,8 +28,20 @@ import (
 
 const (
 	ttlValid   = 5 * time.Minute
-	ttlInvalid = 30 * time.Second
+	ttlInvalid = 30 * time.Second // reduced from 5 min to limit negative-cache pollution
+
+	// maxBodySize caps request bodies to prevent memory exhaustion from
+	// oversized payloads. 1 MB is far more than any legitimate admin request.
+	maxBodySize = 1 << 20 // 1 MB
+
+	// maxNameLen caps tenant and key name fields.
+	maxNameLen = 256
 )
+
+// validKeyFormat matches the expected API key format: ak_live_ + 32 base62 chars.
+// Keys that don't match are rejected immediately without touching cache or DB,
+// preventing cache pollution from obviously malformed keys.
+var validKeyFormat = regexp.MustCompile(`^ak_live_[0-9A-Za-z]{32}$`)
 
 // Server holds the handlers' dependencies. Lowercase fields => private; they
 // are injected once via New and never mutated.
@@ -37,16 +52,17 @@ type Server struct {
 	rdb        *redis.Client
 	limiter    *ratelimit.Limiter
 	adminToken string
-	keyPepper  string
+	peppers    []string // current pepper first; previous peppers for rotation
 	replicaID  string
+	adminLim   *adminLimiter
 
 	l1Hits atomic.Int64
 	l2Hits atomic.Int64
 	misses atomic.Int64
 }
 
-func New(st *store.Store, c *cache.Cache, l2 *cache.L2, rdb *redis.Client, limiter *ratelimit.Limiter, adminToken, keyPepper, replicaID string) *Server {
-	return &Server{store: st, cache: c, l2: l2, rdb: rdb, limiter: limiter, adminToken: adminToken, keyPepper: keyPepper, replicaID: replicaID}
+func New(st *store.Store, c *cache.Cache, l2 *cache.L2, rdb *redis.Client, limiter *ratelimit.Limiter, adminToken string, peppers []string, replicaID string) *Server {
+	return &Server{store: st, cache: c, l2: l2, rdb: rdb, limiter: limiter, adminToken: adminToken, peppers: peppers, replicaID: replicaID, adminLim: newAdminLimiter(10, 20)}
 }
 
 // Routes builds the router. All registration happens here, once — the lesson
@@ -54,12 +70,13 @@ func New(st *store.Store, c *cache.Cache, l2 *cache.L2, rdb *redis.Client, limit
 func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
-	mux.HandleFunc("POST /admin/tenants", s.handleCreateTenant)
-	mux.HandleFunc("POST /v1/tenants/{id}/keys", s.handleCreateKey)
+	mux.HandleFunc("POST /admin/tenants", adminRateLimit(s.adminLim, s.handleCreateTenant))
+	mux.HandleFunc("POST /admin/token", adminRateLimit(s.adminLim, s.handleMintToken))
+	mux.HandleFunc("POST /v1/tenants/{id}/keys", adminRateLimit(s.adminLim, s.handleCreateKey))
 	mux.HandleFunc("POST /v1/validate", s.handleValidate)
-	mux.HandleFunc("POST /v1/keys/{id}/revoke", s.handleRevokeKey)
+	mux.HandleFunc("POST /v1/keys/{id}/revoke", adminRateLimit(s.adminLim, s.handleRevokeKey))
 	mux.HandleFunc("GET /v1/cache/stats", s.handleCacheStats)
-	mux.HandleFunc("GET /v1/tenants/{id}/usage", s.handleTenantUsage)
+	mux.HandleFunc("GET /v1/tenants/{id}/usage", adminRateLimit(s.adminLim, s.handleTenantUsage))
 	mux.HandleFunc("GET /readyz", s.handleReadyz)
 	mux.Handle("GET /metrics", promhttp.Handler()) // ← expose the metrics page
 	return metricsMiddleware(mux)
@@ -72,7 +89,7 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleCreateTenant(w http.ResponseWriter, r *http.Request) {
-	if !s.authAdmin(r) {
+	if !s.authAdmin(r, adminauth.ScopeTenantsWrite) {
 		writeJSONError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
@@ -80,12 +97,13 @@ func (s *Server) handleCreateTenant(w http.ResponseWriter, r *http.Request) {
 		Name         string `json:"name"`
 		MonthlyQuota *int64 `json:"monthly_quota"`
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid JSON")
 		return
 	}
-	if strings.TrimSpace(req.Name) == "" {
-		writeJSONError(w, http.StatusBadRequest, "name is required")
+	if err := validateName(req.Name); err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -99,10 +117,11 @@ func (s *Server) handleCreateTenant(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	_ = json.NewEncoder(w).Encode(tenant)
+	auditLog(r, "create_tenant", tenant.ID, req.Name)
 }
 
 func (s *Server) handleCreateKey(w http.ResponseWriter, r *http.Request) {
-	if !s.authAdmin(r) {
+	if !s.authAdmin(r, adminauth.ScopeKeysWrite) {
 		writeJSONError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
@@ -111,12 +130,13 @@ func (s *Server) handleCreateKey(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Name string `json:"name"`
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid JSON")
 		return
 	}
-	if strings.TrimSpace(req.Name) == "" {
-		writeJSONError(w, http.StatusBadRequest, "name is required")
+	if err := validateName(req.Name); err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -127,7 +147,7 @@ func (s *Server) handleCreateKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	keyPrefix := fullKey[:20]
-	keyHash := keys.Hash(s.keyPepper, fullKey)
+	keyHash := keys.Hash(s.peppers[0], fullKey)
 
 	created, err := s.store.CreateAPIKey(r.Context(), tenantID, req.Name, keyPrefix, keyHash)
 	if err != nil {
@@ -150,11 +170,40 @@ func (s *Server) handleCreateKey(w http.ResponseWriter, r *http.Request) {
 		store.APIKey
 		Key string `json:"key"`
 	}{created, fullKey})
+	auditLog(r, "create_key", created.ID, tenantID)
 }
 
-func (s *Server) authAdmin(r *http.Request) bool {
+// authAdmin checks the X-Admin-Token header for either:
+//   - the legacy static token (backward-compatible, grants all scopes), or
+//   - an HMAC-signed JWT with the required scope and valid expiry.
+//
+// It returns true if authorized, false otherwise.
+func (s *Server) authAdmin(r *http.Request, scope adminauth.Scope) bool {
 	got := r.Header.Get("X-Admin-Token")
-	return subtle.ConstantTimeCompare([]byte(got), []byte(s.adminToken)) == 1
+	if got == "" {
+		return false
+	}
+
+	// Legacy: constant-time comparison against the static admin token.
+	if subtle.ConstantTimeCompare([]byte(got), []byte(s.adminToken)) == 1 {
+		return true
+	}
+
+	// JWT path: verify signature, expiry, and scope.
+	claims, err := adminauth.Verify(s.adminToken, got, scope)
+	if err != nil {
+		return false
+	}
+
+	// Structured audit log for JWT-authenticated admin actions.
+	slog.Info("admin_action",
+		"subject", claims.Subject,
+		"scope", string(scope),
+		"method", r.Method,
+		"path", r.URL.Path,
+		"remote_addr", r.RemoteAddr,
+	)
+	return true
 }
 
 func writeJSONError(w http.ResponseWriter, status int, msg string) {
@@ -163,7 +212,28 @@ func writeJSONError(w http.ResponseWriter, status int, msg string) {
 	fmt.Fprintf(w, `{"error":%q}`+"\n", msg)
 }
 
+// validateName checks a name field is non-empty, within length limits, and
+// contains no control characters or null bytes.
+func validateName(name string) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return fmt.Errorf("name is required")
+	}
+	if len(name) > maxNameLen {
+		return fmt.Errorf("name exceeds maximum length of %d characters", maxNameLen)
+	}
+	for _, r := range name {
+		if r == 0 || (r < 32 && r != '\t') {
+			return fmt.Errorf("name contains invalid control characters")
+		}
+	}
+	return nil
+}
+
 func (s *Server) handleValidate(w http.ResponseWriter, r *http.Request) {
+	// Record the start time for timing-floor enforcement on 401 responses.
+	r = r.WithContext(contextWithTime(r.Context(), time.Now()))
+
 	authHeader := r.Header.Get("Authorization")
 	rawKey, ok := strings.CutPrefix(authHeader, "Bearer ")
 	if !ok || rawKey == "" {
@@ -171,7 +241,25 @@ func (s *Server) handleValidate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	keyHash := keys.Hash(s.keyPepper, rawKey)
+	// Reject obviously malformed keys before touching cache or DB.
+	if !validKeyFormat.MatchString(rawKey) {
+		// Apply timing floor to prevent distinguishing malformed from valid keys.
+		elapsed := time.Since(timeFromContext(r.Context()))
+		if pad := 2*time.Millisecond - elapsed; pad > 0 {
+			time.Sleep(pad)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_ = json.NewEncoder(w).Encode(struct {
+			Valid bool `json:"valid"`
+		}{false})
+		return
+	}
+
+	// Hash with the current pepper first; if the key was issued under a
+	// previous pepper (rotation window), we fall back through them all.
+	keyHashes := keys.HashAll(s.peppers, rawKey)
+	keyHash := keyHashes[0]
 	cacheKey := string(keyHash)
 	ctx := r.Context()
 
@@ -192,20 +280,34 @@ func (s *Server) handleValidate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// --- L3: Postgres (source of truth) ---
+	// --- L3: Postgres (source of truth) --- try all pepper versions
 	s.misses.Add(1)
 	validateCacheEvents.WithLabelValues("miss").Inc()
-	vk, err := s.store.ValidateKey(ctx, keyHash)
+
 	var res cache.Result
-	if err != nil {
-		if !errors.Is(err, store.ErrKeyNotValid) {
-			log.Printf("validate key: %v", err)
-			writeJSONError(w, http.StatusInternalServerError, "internal error")
-			return // real DB error → don't cache
+	var found bool
+	for _, kh := range keyHashes {
+		vk, err := s.store.ValidateKey(ctx, kh)
+		if err != nil {
+			if errors.Is(err, store.ErrBackpressure) {
+				writeJSONError(w, http.StatusServiceUnavailable, "service overloaded")
+				return
+			}
+			if !errors.Is(err, store.ErrKeyNotValid) {
+				log.Printf("validate key: %v", err)
+				writeJSONError(w, http.StatusInternalServerError, "internal error")
+				return // real DB error → don't cache
+			}
+			continue // try next pepper
 		}
-		res = cache.Result{Valid: false}
-	} else {
 		res = cache.Result{Valid: true, TenantID: vk.TenantID, KeyID: vk.KeyID, MonthlyQuota: vk.MonthlyQuota}
+		keyHash = kh
+		cacheKey = string(keyHash)
+		found = true
+		break
+	}
+	if !found {
+		res = cache.Result{Valid: false}
 	}
 
 	// write through to both cache tiers
@@ -222,11 +324,31 @@ func ttlFor(res cache.Result) time.Duration {
 	return ttlInvalid
 }
 
+type validateStartKey struct{}
+
+func contextWithTime(ctx context.Context, t time.Time) context.Context {
+	return context.WithValue(ctx, validateStartKey{}, t)
+}
+
+func timeFromContext(ctx context.Context) time.Time {
+	if t, ok := ctx.Value(validateStartKey{}).(time.Time); ok {
+		return t
+	}
+	return time.Now()
+}
+
 func (s *Server) writeValidateResult(w http.ResponseWriter, r *http.Request, cacheKey string, res cache.Result) {
 	w.Header().Set("Content-Type", "application/json")
 
 	// invalid keys: 401, no rate-limit needed
 	if !res.Valid {
+		// Constant-time floor: ensure invalid-key responses take at least 2ms
+		// so they are indistinguishable from valid-but-rejected responses by
+		// latency alone. This mitigates timing side-channel attacks.
+		elapsed := time.Since(timeFromContext(r.Context()))
+		if pad := 2*time.Millisecond - elapsed; pad > 0 {
+			time.Sleep(pad)
+		}
 		w.WriteHeader(http.StatusUnauthorized)
 		_ = json.NewEncoder(w).Encode(struct {
 			Valid bool `json:"valid"`
@@ -264,7 +386,7 @@ func (s *Server) writeValidateResult(w http.ResponseWriter, r *http.Request, cac
 }
 
 func (s *Server) handleRevokeKey(w http.ResponseWriter, r *http.Request) {
-	if !s.authAdmin(r) {
+	if !s.authAdmin(r, adminauth.ScopeKeysRevoke) {
 		writeJSONError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
@@ -294,6 +416,7 @@ func (s *Server) handleRevokeKey(w http.ResponseWriter, r *http.Request) {
 	if err := cache.PublishRevocation(ctx, s.rdb, cacheKey); err != nil {
 		log.Printf("publish revocation: %v", err)
 	}
+	auditLog(r, "revoke_key", keyID, "")
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -321,7 +444,7 @@ func (s *Server) handleCacheStats(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleTenantUsage(w http.ResponseWriter, r *http.Request) {
-	if !s.authAdmin(r) {
+	if !s.authAdmin(r, adminauth.ScopeUsageRead) {
 		writeJSONError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
@@ -379,4 +502,70 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 		Postgres bool `json:"postgres"`
 		Redis    bool `json:"redis"`
 	}{pgOK && redisOK, pgOK, redisOK})
+}
+
+// handleMintToken issues a scoped, short-lived admin JWT. The caller must
+// authenticate with the static ADMIN_TOKEN (bootstrap secret) to mint tokens.
+// This lets operators generate least-privilege tokens for scripts and services.
+func (s *Server) handleMintToken(w http.ResponseWriter, r *http.Request) {
+	// Bootstrap auth: only the static admin token can mint JWTs.
+	got := r.Header.Get("X-Admin-Token")
+	if subtle.ConstantTimeCompare([]byte(got), []byte(s.adminToken)) != 1 {
+		writeJSONError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	var req struct {
+		Subject  string   `json:"subject"`
+		Scopes   []string `json:"scopes"`
+		Lifetime string   `json:"lifetime"` // Go duration string, e.g. "1h"
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	if req.Subject == "" {
+		writeJSONError(w, http.StatusBadRequest, "subject is required")
+		return
+	}
+	if len(req.Scopes) == 0 {
+		writeJSONError(w, http.StatusBadRequest, "at least one scope is required")
+		return
+	}
+
+	lifetime := 1 * time.Hour // default
+	if req.Lifetime != "" {
+		d, err := time.ParseDuration(req.Lifetime)
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid lifetime duration")
+			return
+		}
+		if d > 24*time.Hour {
+			writeJSONError(w, http.StatusBadRequest, "lifetime cannot exceed 24h")
+			return
+		}
+		lifetime = d
+	}
+
+	scopes := make([]adminauth.Scope, len(req.Scopes))
+	for i, s := range req.Scopes {
+		scopes[i] = adminauth.Scope(s)
+	}
+
+	token := adminauth.Mint(s.adminToken, req.Subject, scopes, lifetime)
+
+	slog.Info("admin_token_minted",
+		"subject", req.Subject,
+		"scopes", req.Scopes,
+		"lifetime", lifetime.String(),
+		"remote_addr", r.RemoteAddr,
+	)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(struct {
+		Token     string `json:"token"`
+		ExpiresIn int    `json:"expires_in_seconds"`
+	}{token, int(lifetime.Seconds())})
 }

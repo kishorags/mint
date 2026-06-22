@@ -38,3 +38,14 @@ func Hash(pepper, key string) []byte {
 	mac.Write([]byte(key))
 	return mac.Sum(nil)
 }
+
+// HashAll returns hashes for all provided peppers, enabling a rotation window
+// where the caller tries the current pepper first, then falls back to previous
+// versions. Each entry maps pepper_version (1-indexed) to its hash.
+func HashAll(peppers []string, key string) [][]byte {
+	hashes := make([][]byte, len(peppers))
+	for i, p := range peppers {
+		hashes[i] = Hash(p, key)
+	}
+	return hashes
+}
