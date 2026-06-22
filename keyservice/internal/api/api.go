@@ -117,6 +117,7 @@ func (s *Server) handleCreateTenant(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	_ = json.NewEncoder(w).Encode(tenant)
+	auditLog(r, "create_tenant", tenant.ID, req.Name)
 }
 
 func (s *Server) handleCreateKey(w http.ResponseWriter, r *http.Request) {
@@ -169,6 +170,7 @@ func (s *Server) handleCreateKey(w http.ResponseWriter, r *http.Request) {
 		store.APIKey
 		Key string `json:"key"`
 	}{created, fullKey})
+	auditLog(r, "create_key", created.ID, tenantID)
 }
 
 // authAdmin checks the X-Admin-Token header for either:
@@ -229,6 +231,9 @@ func validateName(name string) error {
 }
 
 func (s *Server) handleValidate(w http.ResponseWriter, r *http.Request) {
+	// Record the start time for timing-floor enforcement on 401 responses.
+	r = r.WithContext(contextWithTime(r.Context(), time.Now()))
+
 	authHeader := r.Header.Get("Authorization")
 	rawKey, ok := strings.CutPrefix(authHeader, "Bearer ")
 	if !ok || rawKey == "" {
@@ -314,11 +319,31 @@ func ttlFor(res cache.Result) time.Duration {
 	return ttlInvalid
 }
 
+type validateStartKey struct{}
+
+func contextWithTime(ctx context.Context, t time.Time) context.Context {
+	return context.WithValue(ctx, validateStartKey{}, t)
+}
+
+func timeFromContext(ctx context.Context) time.Time {
+	if t, ok := ctx.Value(validateStartKey{}).(time.Time); ok {
+		return t
+	}
+	return time.Now()
+}
+
 func (s *Server) writeValidateResult(w http.ResponseWriter, r *http.Request, cacheKey string, res cache.Result) {
 	w.Header().Set("Content-Type", "application/json")
 
 	// invalid keys: 401, no rate-limit needed
 	if !res.Valid {
+		// Constant-time floor: ensure invalid-key responses take at least 2ms
+		// so they are indistinguishable from valid-but-rejected responses by
+		// latency alone. This mitigates timing side-channel attacks.
+		elapsed := time.Since(timeFromContext(r.Context()))
+		if pad := 2*time.Millisecond - elapsed; pad > 0 {
+			time.Sleep(pad)
+		}
 		w.WriteHeader(http.StatusUnauthorized)
 		_ = json.NewEncoder(w).Encode(struct {
 			Valid bool `json:"valid"`
@@ -386,6 +411,7 @@ func (s *Server) handleRevokeKey(w http.ResponseWriter, r *http.Request) {
 	if err := cache.PublishRevocation(ctx, s.rdb, cacheKey); err != nil {
 		log.Printf("publish revocation: %v", err)
 	}
+	auditLog(r, "revoke_key", keyID, "")
 	w.WriteHeader(http.StatusNoContent)
 }
 

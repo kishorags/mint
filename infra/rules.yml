@@ -1,0 +1,67 @@
+groups:
+  - name: mint-slo
+    rules:
+      # Alert if p99 validate latency exceeds the 20ms SLO for 5 minutes.
+      - alert: ValidateP99LatencyHigh
+        expr: histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket{route="/v1/validate"}[5m])) by (le)) > 0.020
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Validate p99 latency above 20ms SLO"
+          description: "The p99 latency for /v1/validate has been above 20ms for 5 minutes. Current value: {{ $value | humanizeDuration }}."
+
+      # Alert if the cache hit rate drops below 95% for 10 minutes.
+      - alert: CacheHitRateLow
+        expr: |
+          (
+            sum(rate(validate_cache_events_total{tier=~"l1|l2"}[10m]))
+            /
+            sum(rate(validate_cache_events_total[10m]))
+          ) < 0.95
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Cache hit rate below 95%"
+          description: "The combined L1+L2 cache hit rate has been below 95% for 10 minutes. Current value: {{ $value | humanizePercentage }}."
+
+      # Alert if the flusher hasn't succeeded in 2x the flush interval (default 60s).
+      - alert: FlusherStale
+        expr: time() - usage_flusher_last_success_timestamp > 60
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Usage flusher has not succeeded recently"
+          description: "No successful usage flush in the last 60 seconds on instance {{ $labels.instance }}."
+
+      # Alert if the Postgres connection pool is fully saturated.
+      - alert: PgxpoolSaturated
+        expr: pgxpool_acquired_conns >= pgxpool_max_conns
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Postgres connection pool is fully saturated"
+          description: "All {{ $value }} connections in the pgxpool are acquired on instance {{ $labels.instance }}. New queries will be blocked or rejected."
+
+      # Alert if the backpressure circuit breaker is rejecting queries.
+      - alert: BackpressureActive
+        expr: rate(store_backpressure_rejected_total[5m]) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Postgres backpressure is actively rejecting queries"
+          description: "The store semaphore is full and queries are being rejected at {{ $value | humanize }}/s on instance {{ $labels.instance }}."
+
+      # Alert if any keyservice replica is down (readyz failing).
+      - alert: ReplicaNotReady
+        expr: up{job="keyservice"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Keyservice replica is down"
+          description: "Instance {{ $labels.instance }} has been unreachable for 1 minute."

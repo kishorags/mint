@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/redis/go-redis/v9"
 	"log"
 	"log/slog"
@@ -117,6 +118,7 @@ func main() {
 	log.Printf("postgres ok: max_conns=%d", cfg.MaxConns)
 
 	st := store.New(pool)
+	prometheus.MustRegister(store.NewPoolCollector(pool))
 	c := cache.New()
 	// Pre-warm L1 with the hot key set (skip if PREWARM_LIMIT=0).
 	if prewarmLimit > 0 {

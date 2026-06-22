@@ -1,0 +1,97 @@
+# Redis High Availability overlay — provides a 3-node Redis Sentinel cluster.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.ha.yml up -d --build
+#
+# This overlay replaces the single Redis instance with a primary + 2 replicas
+# and 3 Sentinel nodes for automatic failover. The keyservice is configured to
+# use the Sentinel-aware client.
+#
+# Failover behavior:
+#   - Auth (key validation): fails closed — returns 401/503 on error.
+#   - Rate-limiting: fails open — allows requests if Redis is unreachable.
+#   - Usage metering: buffered in Redis; flusher retries on next interval.
+
+services:
+  # Override keyservice to use Sentinel-based Redis connection.
+  keyservice:
+    environment:
+      # Sentinel connection string: comma-separated sentinel addresses.
+      REDIS_SENTINELS: "sentinel-1:26379,sentinel-2:26379,sentinel-3:26379"
+      REDIS_MASTER_NAME: "mymaster"
+      # Clear the single-instance REDIS_URL so the app uses Sentinel instead.
+      REDIS_URL: ""
+    depends_on:
+      redis-primary:
+        condition: service_healthy
+      sentinel-1:
+        condition: service_started
+
+  # Primary Redis node.
+  redis-primary:
+    image: redis:7-alpine@sha256:b1addbe72465a718643cff9e60a58e6df1841e29d6d7d60c9a85d8d72f08d1a7
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_primary_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Redis replica 1.
+  redis-replica-1:
+    image: redis:7-alpine@sha256:b1addbe72465a718643cff9e60a58e6df1841e29d6d7d60c9a85d8d72f08d1a7
+    command: ["redis-server", "--appendonly", "yes", "--replicaof", "redis-primary", "6379"]
+    depends_on:
+      redis-primary:
+        condition: service_healthy
+
+  # Redis replica 2.
+  redis-replica-2:
+    image: redis:7-alpine@sha256:b1addbe72465a718643cff9e60a58e6df1841e29d6d7d60c9a85d8d72f08d1a7
+    command: ["redis-server", "--appendonly", "yes", "--replicaof", "redis-primary", "6379"]
+    depends_on:
+      redis-primary:
+        condition: service_healthy
+
+  # Sentinel nodes (3 for quorum).
+  sentinel-1:
+    image: redis:7-alpine@sha256:b1addbe72465a718643cff9e60a58e6df1841e29d6d7d60c9a85d8d72f08d1a7
+    command: >
+      sh -c 'echo "sentinel monitor mymaster redis-primary 6379 2" > /tmp/sentinel.conf &&
+             echo "sentinel down-after-milliseconds mymaster 5000" >> /tmp/sentinel.conf &&
+             echo "sentinel failover-timeout mymaster 10000" >> /tmp/sentinel.conf &&
+             redis-sentinel /tmp/sentinel.conf'
+    depends_on:
+      redis-primary:
+        condition: service_healthy
+
+  sentinel-2:
+    image: redis:7-alpine@sha256:b1addbe72465a718643cff9e60a58e6df1841e29d6d7d60c9a85d8d72f08d1a7
+    command: >
+      sh -c 'echo "sentinel monitor mymaster redis-primary 6379 2" > /tmp/sentinel.conf &&
+             echo "sentinel down-after-milliseconds mymaster 5000" >> /tmp/sentinel.conf &&
+             echo "sentinel failover-timeout mymaster 10000" >> /tmp/sentinel.conf &&
+             redis-sentinel /tmp/sentinel.conf'
+    depends_on:
+      redis-primary:
+        condition: service_healthy
+
+  sentinel-3:
+    image: redis:7-alpine@sha256:b1addbe72465a718643cff9e60a58e6df1841e29d6d7d60c9a85d8d72f08d1a7
+    command: >
+      sh -c 'echo "sentinel monitor mymaster redis-primary 6379 2" > /tmp/sentinel.conf &&
+             echo "sentinel down-after-milliseconds mymaster 5000" >> /tmp/sentinel.conf &&
+             echo "sentinel failover-timeout mymaster 10000" >> /tmp/sentinel.conf &&
+             redis-sentinel /tmp/sentinel.conf'
+    depends_on:
+      redis-primary:
+        condition: service_healthy
+
+  # Remove the standalone redis service from the base compose.
+  redis:
+    profiles: ["disabled"]
+
+volumes:
+  redis_primary_data:

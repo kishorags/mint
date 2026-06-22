@@ -22,4 +22,12 @@ var (
 		Name: "usage_flush_tenants",
 		Help: "Tenants mirrored in the most recent flush.",
 	})
+	FlushIsLeader = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "usage_flusher_is_leader",
+		Help: "1 if this replica currently holds the flush leader lease, 0 otherwise.",
+	})
+	FlushLastSuccess = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "usage_flusher_last_success_timestamp",
+		Help: "Unix timestamp of the last successful usage flush on this replica.",
+	})
 )

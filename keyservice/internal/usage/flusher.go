@@ -36,8 +36,10 @@ func (f *Flusher) Run(ctx context.Context) {
 			return
 		case <-ticker.C:
 			if !f.acquireLease(ctx) {
+				FlushIsLeader.Set(0)
 				continue
 			}
+			FlushIsLeader.Set(1)
 			t0 := time.Now()
 			n, err := f.FlushOnce(ctx)
 			flushDuration.Observe(float64(time.Since(t0).Seconds()))
@@ -47,6 +49,7 @@ func (f *Flusher) Run(ctx context.Context) {
 			}
 			flushWrites.Add(float64(n))
 			flushTenants.Set(float64(n))
+			FlushLastSuccess.SetToCurrentTime()
 			if n > 0 {
 				log.Printf("usage flush: mirrored %d counter(s) to postgres (replica=%s)", n, f.replicaID)
 			}
